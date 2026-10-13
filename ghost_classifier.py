@@ -203,6 +203,46 @@ class ColorClassifier:
         if m != self._labels_mtime:
             self.reload()
 
+    def add_label(self, crop_bgr: np.ndarray, kind: str, colour: str, frac: float) -> Optional[Path]:
+        """Save one crop you labelled (on the overlay) exactly like label_ghosts.py does, and teach the
+        running model immediately. File name starts with the size fraction (used to calibrate small/boss)."""
+        colour = str(colour).replace("-", " ")
+        allowed = SMALL_COLORS if kind == SMALL else BOSS_COLORS if kind == BOSS else ()
+        if colour not in allowed:
+            return None
+        ft = color_features(crop_bgr)
+        if ft is None:
+            return None
+        dest = self.root / "labels" / f"{kind}_{colour.replace(' ', '-')}"
+        dest.mkdir(parents=True, exist_ok=True)
+        stamp = int(time.time() * 1000)
+        while True:
+            path = dest / f"{frac:.3f}_{kind}-{colour.replace(' ', '-')}_{stamp}_ov.png"
+            if not path.exists():
+                break
+            stamp += 1
+        ok, buf = cv2.imencode(".png", crop_bgr)
+        if not ok:
+            return None
+        try:
+            buf.tofile(str(path))                         # same unicode-safe route the loader reads with
+        except OSError as exc:
+            log.warning("could not save label %s: %s", path.name, exc)
+            return None
+        self._X = ft[None, :] if self._X is None else np.vstack([self._X, ft])
+        self._y.append((kind, colour))
+        self._meta.append((0.0, None))                    # same as labels/ files loaded by reload()
+        return path
+
+    def remove_label(self, path: Path) -> bool:
+        """Undo add_label()."""
+        try:
+            Path(path).unlink()
+        except OSError:
+            return False
+        self.reload()
+        return True
+
     def label_counts(self) -> Dict[str, int]:
         out: Dict[str, int] = {}
         for kind, color in self._y:
@@ -636,6 +676,29 @@ class GhostScene:
             out.append(nxt)
             cur = (nxt.cx, nxt.cy)
         return out
+
+    # ----- teaching from the overlay -----
+    def ghost_at(self, x: float, y: float, margin: float = 0.15) -> Optional[Ghost]:
+        """The labelled ghost under a point (frame pixels), nearest centre first; margin forgives a moving box."""
+        best, bd = None, 1e18
+        for g in self.scene.ghosts:
+            m = margin * max(g.w, g.h)
+            if g.x - m <= x <= g.x + g.w + m and g.y - m <= y <= g.y + g.h + m:
+                d = (x - g.cx) ** 2 + (y - g.cy) ** 2
+                if d < bd:
+                    best, bd = g, d
+        return best
+
+    def teach_color(self, frame: np.ndarray, g: Ghost, kind: str, colour: str) -> Optional[Path]:
+        """Label ghost g as kind/colour from the overlay (same crop padding as collect_unlabeled)."""
+        pad = int(0.15 * max(g.w, g.h))
+        crop = frame[max(0, g.y - pad):g.y + g.h + pad, max(0, g.x - pad):g.x + g.w + pad]
+        if crop.size == 0:
+            return None
+        path = self.colors.add_label(crop, kind, colour, g.h / max(1, frame.shape[0]))
+        if path is not None:
+            self.calibrate_size()                        # a new size example may move the small/boss split
+        return path
 
     # ----- on-screen overlay data -----
     @staticmethod
