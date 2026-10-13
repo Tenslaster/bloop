@@ -1,0 +1,14 @@
+# Runtime dependencies (Python 3.10–3.12 recommended on Windows)
+numpy>=1.24,<3
+opencv-python>=4.8,<5
+mss>=9,<11
+pydirectinput>=1.0.4,<2
+keyboard>=0.13.5,<1
+pywin32>=306; platform_system == "Windows"
+pynput>=1.7.6,<2
+requests>=2.31,<3
+pytesseract>=0.3.10,<1
+Pillow>=10,<13
+
+# Optional development/test dependencies
+pytest>=8,<9
