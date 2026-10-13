@@ -431,6 +431,11 @@ def load_config(path: Path) -> Config:
     cfg.smart_retry_max = max(0, min(int(cfg.smart_retry_max), 5))
     cfg.smart_threshold_floor = max(0.5, min(float(cfg.smart_threshold_floor), 0.99))
     cfg.smart_probe_interval_s = max(5.0, min(float(cfg.smart_probe_interval_s), 600.0))
+    # Teach-window export is optional but runs on the bot's capture path while
+    # the window is open. Bound both controls so malformed/old config files
+    # cannot force full-resolution JPEG writes every frame or oversized previews.
+    cfg.teach_gui_interval_s = max(0.10, min(float(cfg.teach_gui_interval_s), 2.5))
+    cfg.teach_gui_max_w = max(480, min(int(cfg.teach_gui_max_w), 2560))
     cfg.smart_aug_pos = max(0, min(int(cfg.smart_aug_pos), 24))
     cfg.smart_aug_neg = max(0, min(int(cfg.smart_aug_neg), 8))
     valid_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
