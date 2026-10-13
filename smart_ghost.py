@@ -549,6 +549,7 @@ class Track:
     neg_logged: int = 0
     pos_logged: bool = False
     retries: int = 0
+    auto_logged: bool = False          # the overlay auto-learner already took a sample from this track
 
     @property
     def center(self) -> Tuple[float, float]:
@@ -632,7 +633,7 @@ class SampleStore:
             return out
         self.pos, self.neg = load_dir(self.pos_dir), load_dir(self.neg_dir)
 
-    def add(self, crop: np.ndarray, positive: bool, weight: float, tag: str) -> None:
+    def add(self, crop: np.ndarray, positive: bool, weight: float, tag: str) -> Optional[Path]:
         d = self.pos_dir if positive else self.neg_dir
         stamp = int(time.time() * 1000)
         name = f"{stamp}_{tag}_w{weight:.2f}.png"
@@ -651,6 +652,20 @@ class SampleStore:
                         old.unlink()
                     except OSError:
                         pass
+            return path
+        return None
+
+    def discard(self, path: Path) -> bool:
+        """Delete a sample outright (used to undo an overlay action the same minute)."""
+        path = Path(path)
+        with self.lock:
+            self.pos = [(q, w) for q, w in self.pos if q != path]
+            self.neg = [(q, w) for q, w in self.neg if q != path]
+        try:
+            path.unlink()
+            return True
+        except OSError:
+            return False
 
     def snapshot(self):
         with self.lock:
@@ -815,6 +830,8 @@ class SmartGhost:
         self.status_path = self.dir / "status.json"
         self.review_path = self.dir / "review.json"
         self.stats["auto_removed"] = 0
+        self.stats.update({"ov_confirm": 0, "ov_reject": 0, "ov_auto": 0})
+        self._last_ov_auto = 0.0
         self.stats.update({"ecto_gains": 0, "ecto_bot": 0, "ecto_user": 0, "ecto_unattributed": 0,
                            "ecto_positives": 0, "aim_misses": 0, "retries": 0, "probes": 0, "ecto_amount": 0})
 
@@ -863,6 +880,115 @@ class SmartGhost:
                     return                                   # that was the bot, not the player
             self._clicks.append((t, int(sx), int(sy)))
         self.stats["user_clicks"] += 1
+
+    # ---------------- learning from the on-screen overlay ----------------
+    def _track_for_box(self, box: Box, min_iou: float = 0.3) -> Optional[Track]:
+        best, bi = None, min_iou
+        for tr in self.last_tracks:
+            v = _iou(tr.box, box)
+            if v >= bi:
+                best, bi = tr, v
+        return best
+
+    def overlay_feedback(self, frame: np.ndarray, box: Box, positive: bool,
+                         weight_scale: float = 1.0) -> Optional[Path]:
+        """You told the overlay "this box IS / is NOT a ghost". Saved like a click (positive) or like F8 (negative).
+        Returns the saved sample path (for undo), or None when nothing was learned."""
+        if self.autoplay:
+            return None                                   # AUTO PLAY never learns
+        crop = self._crop(frame, tuple(int(v) for v in box), pad=0.10)
+        if crop is None:
+            return None
+        H = frame.shape[0]
+        weight = (1.2 if positive else 1.5) * float(weight_scale)
+        if self.model.trained:
+            p = float(self.model.predict(features(crop, self.model.ref_h or H)[None, :])[0])
+            if (positive and p < 0.5) or (not positive and p > 0.5):
+                weight *= 1.5                             # the model was wrong here: learn harder
+        path = self.store.add(crop, positive, weight, "ovconf" if positive else "ovrej")
+        if path is None:
+            return None
+        tr = self._track_for_box(tuple(int(v) for v in box))
+        if positive:
+            if tr is not None:
+                tr.pos_logged = True
+            self.stats["ov_confirm"] += 1
+            self.stats["pos_added"] += 1
+            self._since_train_pos += 1
+        else:
+            if tr is not None:
+                tr.neg_logged = max(tr.neg_logged, 2)     # stop the scenery miner re-adding it
+            self.stats["ov_reject"] += 1
+            self.stats["neg_added"] += 1
+            self._since_train_neg += 3                    # same push as F8
+        log.info("SMART: overlay %s: %s sample saved box=%dx%d weight=%.2f total_pos=%d total_neg=%d",
+                 "confirmed" if positive else "rejected", "positive" if positive else "negative",
+                 int(box[2]), int(box[3]), weight, len(self.store.pos), len(self.store.neg))
+        return path
+
+    def overlay_undo(self, path: Path) -> bool:
+        """Take back one overlay_feedback() sample."""
+        was_pos = Path(path).parent.name == "positives"
+        if not self.store.discard(path):
+            return False
+        key = "ov_confirm" if was_pos else "ov_reject"
+        self.stats[key] = max(0, self.stats[key] - 1)
+        return True
+
+    def overlay_auto_learn(self, frame: np.ndarray, boxes: List[Box], now: float) -> int:
+        """Learn from boxes the overlay is SHOWING, with no input from you - but only the safest ones:
+        the model is very sure (p high for several frames), the box really moves (scenery is not a ghost),
+        nobody clicked it, and the share of such self-labelled samples stays small. They are saved with the
+        'ovauto' tag at low weight, so auto-clean drops them first and the Sample manager can filter them.
+        Never active in AUTO PLAY. Returns the number of samples added (0 or 1 per call)."""
+        cfg = self.cfg
+        if self.autoplay or not bool(getattr(cfg, "overlay_auto_learn", True)):
+            return 0
+        if self.popup or not self.model.trained or not self.ready():
+            return 0
+        if now - self._last_ov_auto < float(getattr(cfg, "overlay_auto_interval_s", 2.0)):
+            return 0
+        if self.stats["ov_auto"] >= int(getattr(cfg, "overlay_auto_max_session", 60)):
+            return 0
+        pos, _neg = self.store.snapshot()
+        n_auto = sum(1 for q, _w in pos if SampleStore.tag_of(q) == "ovauto")
+        if (n_auto + 1) > float(getattr(cfg, "overlay_auto_max_share", 0.25)) * (len(pos) + 1):
+            return 0
+        H = frame.shape[0]
+        min_p = float(getattr(cfg, "overlay_auto_min_p", 0.93))
+        awaiting = {pd.tid for pd in self._await}
+        best, best_p = None, 0.0
+        for b in boxes:
+            tr = self._track_for_box(tuple(int(v) for v in b[:4]))
+            if tr is None or tr.auto_logged or tr.pos_logged or tr.neg_logged or tr.clicked_at:
+                continue
+            if tr.tid in awaiting:
+                continue                                  # a bot click on it is still being judged
+            if tr.p_n < 3 or tr.p < min_p or tr.hits < 8 or now - tr.t_first < 0.8:
+                continue
+            if tr.speed < 0.01 * H:
+                continue                                  # sits still: scenery, not a ghost
+            cx, cy = tr.center
+            if self._excluded(int(cx), int(cy)):
+                continue
+            if tr.p > best_p:
+                best, best_p = tr, tr.p
+        if best is None:
+            return 0
+        crop = self._crop(frame, best.box, pad=0.10)
+        if crop is None:
+            return 0
+        weight = float(getattr(cfg, "overlay_auto_weight", 0.35))
+        if self.store.add(crop, True, weight, "ovauto") is None:
+            return 0
+        best.auto_logged = True
+        best.pos_logged = True
+        self._last_ov_auto = now
+        self.stats["ov_auto"] += 1
+        self.stats["pos_added"] += 1                      # counted, but it does not trigger a retrain by itself
+        log.info("SMART: overlay auto-learned a ghost p=%.2f box=%dx%d weight=%.2f (auto samples %d/%d positives)",
+                 best.p, best.box[2], best.box[3], weight, n_auto + 1, len(pos) + 1)
+        return 1
 
     def mark_bad(self) -> None:
         """Hotkey: the bot's most recent smart click was wrong -> teach a negative."""
@@ -1612,9 +1738,11 @@ class SmartGhost:
     # A positive the cross-validated model is sure is NOT a ghost (or a negative it is sure IS
     # one) is probably a mislabel: a stray click, a ghost mined as scenery, ... Such samples are
     # moved to smart/quarantine/ (reversible), never deleted. Explicit F8 negatives are protected.
-    _POS_THR = {"user": 0.03, "react": 0.15, "seed": 0.10, "ecto": 0.0}
+    _POS_THR = {"user": 0.03, "react": 0.15, "seed": 0.10, "ecto": 0.0,
+                "ovconf": 0.03,      # you confirmed it on the overlay: trusted like a click
+                "ovauto": 0.30}      # the model's own overlay guess: first to go when cross-validation doubts it
     _NEG_THR = {"static": 0.97, "ignored": 0.90, "noreact": 0.92}
-    _PROTECTED_NEG = {"bad"}
+    _PROTECTED_NEG = {"bad", "ovrej"}      # explicit "not a ghost" verdicts are never auto-removed
 
     def _clean_pass(self, aug_pos: int = 8, aug_neg: int = 2, folds: int = 5,
                     max_frac: float = 0.08, force: bool = False, repeats: int = 2) -> Dict[str, float]:
