@@ -332,6 +332,8 @@ class VisionGUI:
         self.stop_btn = ttk.Button(actions, text="■ Stop", style="Dock.Danger.TButton",
                                    command=self._stop_process, state="disabled")
         self.stop_btn.pack(side="left", padx=5)
+        self.teach_btn = ttk.Button(actions, text="✎ Teach", style="Dock.TButton", command=self._open_teach_window)
+        self.teach_btn.pack(side="left", padx=5)
         ttk.Button(actions, text="Save", style="Dock.Save.TButton", command=self._save_settings).pack(side="left", padx=(5, 0))
         self.dirty_lbl = tk.Label(dock, text="● All settings saved", bg=SIDE, fg=MUTED,
                                   font=("Segoe UI", 8))
@@ -961,6 +963,9 @@ class VisionGUI:
         self._field(d, "Ghosts to learn before it acts", "smart_min_positives", 6, 1)
         self._field(d, "Frames a ghost must stay confirmed", "smart_confirm_frames", 7, 0)
         self._field(d, "Aim-ahead ms (0 = automatic)", "smart_lead_ms", 7, 1)
+        self._check(d, "Allow the Teach window to label what the bot sees", "teach_gui", 8, 0)
+        ttk.Button(d, text="Open teach window", style="Accent.TButton", command=self._open_teach_window).grid(
+            row=8, column=1, sticky="w", padx=3, pady=4)
         p = self._group(tab, "Popup auto-dismiss ('esprits attrapés' banner)", 2, 0, columnspan=2,
                         subtitle="When the banner appears, the handler tries the configured drag-down / drag-up sequence and then a double-click fallback. It blocks ghost clicks while the banner is handled. Test with Preview first; needs the banner template image in the project folder.")
         self._check(p, "Auto-dismiss the 'esprits attrapés' banner", "popup_dismiss", 0, 0)
@@ -1292,14 +1297,16 @@ class VisionGUI:
 
         c = self._group(tab, "Review & retrain", 1, 1,
                         subtitle="Browse thumbnails, quarantine or flip mislabelled samples, then retrain. Auto-clean quarantines samples the cross-validated model strongly disagrees with.")
-        ttk.Button(c, text="Open sample manager", style="Accent.TButton", command=self._open_sample_manager).grid(
-            row=0, column=0, sticky="w", padx=3, pady=4)
-        ttk.Button(c, text="Auto-clean + retrain now", command=lambda: self._smart_request("clean")).grid(
+        ttk.Button(c, text="Open teach window (label ghosts live)", style="Accent.TButton",
+                   command=self._open_teach_window).grid(row=0, column=0, sticky="w", padx=3, pady=4)
+        ttk.Button(c, text="Open sample manager", command=self._open_sample_manager).grid(
             row=1, column=0, sticky="w", padx=3, pady=4)
-        ttk.Button(c, text="Retrain now", command=lambda: self._smart_request("retrain")).grid(
+        ttk.Button(c, text="Auto-clean + retrain now", command=lambda: self._smart_request("clean")).grid(
             row=2, column=0, sticky="w", padx=3, pady=4)
-        ttk.Button(c, text="Open samples folder", command=lambda: self._open_path(self.project / "smart")).grid(
+        ttk.Button(c, text="Retrain now", command=lambda: self._smart_request("retrain")).grid(
             row=3, column=0, sticky="w", padx=3, pady=4)
+        ttk.Button(c, text="Open samples folder", command=lambda: self._open_path(self.project / "smart")).grid(
+            row=4, column=0, sticky="w", padx=3, pady=4)
 
     @staticmethod
     def _count_pngs(folder: Path) -> int:
@@ -1598,6 +1605,24 @@ class VisionGUI:
             self._sample_manager = SampleManager(self.root, self.project, self._smart_request)
         except Exception as exc:
             messagebox.showerror("Sample manager", f"Could not open the sample manager:\n{exc}", parent=self.root)
+
+    def _open_teach_window(self):
+        existing = getattr(self, "_teach_window", None)
+        try:
+            if existing is not None and existing.winfo_exists():
+                existing.lift()
+                existing.focus_force()
+                return
+        except Exception:
+            pass
+        try:
+            from teach_gui import TeachWindow
+            self._teach_window = TeachWindow(
+                self.root, self.project, self._smart_request,
+                palette=dict(BG=BG, PANEL=PANEL, PANEL2=PANEL2, EDGE=EDGE, TEXT=TEXT, MUTED=MUTED, ACCENT=ACCENT,
+                             ORANGE=ORANGE, RED=RED, GREEN=GREEN, BLUE=BLUE))
+        except Exception as exc:
+            messagebox.showerror("Teach window", f"Could not open the teach window:\n{exc}", parent=self.root)
 
     def _smart_request(self, action: str):
         """Run one smart job at a time and stream output; never kill cleaning at 900s.
