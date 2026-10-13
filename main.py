@@ -38,6 +38,10 @@ try:
     from ghost_overlay import GhostOverlay, OVERLAY_HWNDS
 except ImportError:
     GhostOverlay, OVERLAY_HWNDS = None, set()
+try:
+    from overlay_teacher import OverlayTeacher
+except ImportError:      # teaching from the overlay is optional
+    OverlayTeacher = None
 
 # ADD THIS:
 try:
@@ -321,6 +325,18 @@ class Config:
     ghost_preview_force: bool = False     # show it even when it would overlap the game (the bot may then see it!)
     ghost_preview_width: int = 960
     labeling_collect: bool = True         # save crops to labels/unlabeled/ for label_ghosts.py
+    # learn from the on-screen overlay (see overlay_teacher.py). Never active in AUTO PLAY.
+    teach_gui: bool = True                # the GUI's Teach window: click a box in a live picture and label it
+    teach_gui_interval_s: float = 0.4     # ... how often the bot hands it a new picture (only while it is open)
+    teach_gui_max_w: int = 1280           # ... pictures are downscaled to this width for display (training uses full size)
+    overlay_teach: bool = False           # OLD F4 teach mode (hover a box + keys); the Teach window replaces it
+    overlay_teach_timeout_s: float = 45.0 # teach mode switches itself off after this long without a key
+    overlay_auto_learn: bool = True       # save boxes the model is very sure about as low-weight positives
+    overlay_auto_min_p: float = 0.93      # ... only when its probability is at least this
+    overlay_auto_interval_s: float = 2.0  # ... at most one sample per this many seconds
+    overlay_auto_max_session: int = 60    # ... and at most this many per run
+    overlay_auto_max_share: float = 0.25  # ... and never more than this share of all positives
+    overlay_auto_weight: float = 0.35     # training weight of such a sample (a click is ~1.0)
 
     # hotkeys
     hk_pause: str = "f9"
@@ -328,6 +344,7 @@ class Config:
     hk_zone: str = "f7"
     hk_reload: str = "f10"
     hk_bad: str = "f8"      # tell the smart detector its last click was NOT a ghost
+    hk_teach: str = "f4"    # toggle overlay teach mode (hover a ghost box + SPACE / X / colour keys)
 
     # exclusions (window-relative [x,y,w,h])
     exclusion_zones: List[List[int]] = field(default_factory=list)
@@ -2032,6 +2049,7 @@ class AutonomousBot:
         self._last_wave_pos: Optional[Tuple[int, int]] = None
         self._preview_ok = bool(cfg.ghost_preview)
         self.overlay = None
+        self.teacher = None
         self._overlay_checked = False
         self._recent_picks: deque = deque(maxlen=24)     # (time, (x, y, w, h), p) of boxes the learner chose
         self._last_ghost_diag = 0.0
@@ -2058,6 +2076,19 @@ class AutonomousBot:
                 log.warning("ghost labels disabled: %s", exc)
         elif cfg.ghost_scene:
             log.warning("ghost_classifier.py not found next to main.py; labels/waves disabled.")
+        if (OverlayTeacher is not None and self.ghost_scene is not None
+                and self.smart is not None and not cfg.smart_autoplay
+                and (cfg.teach_gui or (self.overlay is not None and (cfg.overlay_teach or cfg.overlay_auto_learn)))):
+            try:
+                self.teacher = OverlayTeacher(cfg, self.smart, self.ghost_scene,
+                                              keyboard if HAS_KEYBOARD else None,
+                                              has_overlay=self.overlay is not None)
+                log.info("GHOSTS: teaching ON (Teach window %s, F4 mode %s, overlay auto-learn %s)",
+                         "available" if cfg.teach_gui else "off",
+                         f"{cfg.hk_teach.upper()}" if (cfg.overlay_teach and self.overlay is not None) else "off",
+                         "on" if (cfg.overlay_auto_learn and self.overlay is not None) else "off")
+            except Exception as exc:
+                log.warning("overlay teaching disabled: %s", exc)
 
         self.dismisser = None
         if getattr(cfg, "popup_dismiss", False):
@@ -2414,6 +2445,8 @@ class AutonomousBot:
         self._persist()
         if self.smart is not None:
             self.smart.stop()
+        if self.teacher is not None:
+            self.teacher.shutdown()
         if self.overlay is not None:
             self.overlay.stop()
         log.info("Saved and stopped.")
@@ -3667,9 +3700,16 @@ class AutonomousBot:
                                     "capture exclusion?) - overlay turned OFF so the bot never reads its own labels.")
                         self.overlay.stop()
                         self.overlay = None
+                        if self.teacher is not None:
+                            self.teacher.overlay_lost()      # F4 mode + overlay auto-learning stop; the Teach window stays
                         return scene
                     log.info("GHOSTS: overlay self-test passed (labels are invisible to the bot).")
-                self.overlay.push(rect, gs.overlay_items(now))
+                items = gs.overlay_items(now)
+                if self.teacher is not None:
+                    items = self.teacher.process(frame, rect, now, items)
+                self.overlay.push(rect, items)
+            elif self.teacher is not None:       # no overlay (or no window rect): the Teach window still works
+                self.teacher.process(frame, rect, now, {})
             return scene
         except Exception as exc:       # labels must never be able to stop the bot
             if now - self._last_smart_err > 5.0:
@@ -4192,7 +4232,11 @@ def main():
             keyboard.add_hotkey(cfg.hk_reload, bot.request_reload)
             if bot.smart is not None:
                 keyboard.add_hotkey(cfg.hk_bad, bot.smart.mark_bad)
-            log.info("Hotkeys registered (F9 pause, F7 exclusion, F10 reload, F8 bad-click, F12 quit).")
+            f4 = bot.teacher is not None and cfg.overlay_teach and bot.teacher.has_overlay
+            if f4:
+                keyboard.add_hotkey(cfg.hk_teach, bot.teacher.request_toggle)
+            log.info("Hotkeys registered (F9 pause, F7 exclusion, F10 reload, F8 bad-click, F12 quit%s).",
+                     f", {cfg.hk_teach.upper()} teach mode" if f4 else "")
         except Exception as exc:
             log.warning("Could not register global hotkeys (%s); use Ctrl+C to quit.", exc)
     else:
