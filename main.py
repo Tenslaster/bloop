@@ -42,6 +42,10 @@ try:
     from overlay_teacher import OverlayTeacher
 except ImportError:      # teaching from the overlay is optional
     OverlayTeacher = None
+try:
+    from home_guard import HomeGuard      # puts the character back on its starting spot
+except ImportError:
+    HomeGuard = None
 
 # ADD THIS:
 try:
@@ -338,6 +342,28 @@ class Config:
     overlay_auto_max_share: float = 0.25  # ... and never more than this share of all positives
     overlay_auto_weight: float = 0.35     # training weight of such a sample (a click is ~1.0)
 
+    # return-to-start-spot (home_guard.py). Click-to-move games: when the character has wandered off
+    # (e.g. walked toward a ghost), click on the feet position it started from.
+    home_guard: bool = True               # needs pictures of your character: press hk_home and draw a box around it
+    home_camera_follow: bool = False      # True when the game view scrolls with the character
+    home_tolerance_px: int = 36           # closer than this to home = fine, no click
+    home_check_interval_s: float = 10.0   # how often the character is looked for when idle
+    home_busy_interval_s: float = 10.0    # ... and while ghosts are being clicked (keeps FPS up)
+    home_quiet_s: float = 0.8             # no bot click for this long before returning home
+    home_user_idle_s: float = 3.0         # ... and no click from YOU for this long (Live mode)
+    home_stable_px: int = 4               # character must hold still (moves less than this) between two checks
+    home_retry_s: float = 2.5             # wait this long before clicking home again
+    home_max_attempts: int = 4            # then pause for 15 s (blocked path / wrong spot)
+    home_match_threshold: float = 0.55    # picture-match score needed to trust "that is my character"
+    home_auto_learn: bool = True          # keep learning new poses of your character by itself while running
+    home_max_samples: int = 120           # how many avatar pictures are kept (oldest automatic ones are replaced)
+    home_auto_min_score: float = 0.75     # a new pose is only learned when the match is at least this sure
+    home_auto_interval_s: float = 4.0     # ... and at most one new picture per this many seconds
+    home_force_after_s: float = 6.0       # away from home this long while the bot keeps clicking ghosts: go home anyway
+    home_template_w: int = 60             # only used when the picture window cannot open: box size ending at the mouse
+    home_template_h: int = 90
+    home_shift_min_response: float = 0.12 # camera-follow only: minimum confidence of the scroll measurement
+
     # hotkeys
     hk_pause: str = "f9"
     hk_quit: str = "f12"
@@ -345,6 +371,9 @@ class Config:
     hk_reload: str = "f10"
     hk_bad: str = "f8"      # tell the smart detector its last click was NOT a ghost
     hk_teach: str = "f4"    # toggle overlay teach mode (hover a ghost box + SPACE / X / colour keys)
+    hk_home: str = "f6"     # freeze the screen, drag a box around your character (head to feet), ENTER: saves a picture of it (only the first one also sets home)
+    hk_home_rearm: str = "f5"   # toggle home system ON/OFF (character search + return-to-home)
+    home_enabled: bool = True             # starting state of the F5 toggle (True = search + return-home active)
 
     # exclusions (window-relative [x,y,w,h])
     exclusion_zones: List[List[int]] = field(default_factory=list)
@@ -438,6 +467,22 @@ def load_config(path: Path) -> Config:
     cfg.teach_gui_max_w = max(480, min(int(cfg.teach_gui_max_w), 2560))
     cfg.smart_aug_pos = max(0, min(int(cfg.smart_aug_pos), 24))
     cfg.smart_aug_neg = max(0, min(int(cfg.smart_aug_neg), 8))
+    cfg.home_tolerance_px = max(8, min(int(cfg.home_tolerance_px), 400))
+    cfg.home_check_interval_s = max(0.5, min(float(cfg.home_check_interval_s), 30.0))
+    cfg.home_busy_interval_s = max(1.0, min(float(getattr(cfg, "home_busy_interval_s", 10.0)), 30.0))
+    cfg.home_quiet_s = max(0.0, min(float(cfg.home_quiet_s), 30.0))
+    cfg.home_user_idle_s = max(0.0, min(float(cfg.home_user_idle_s), 60.0))
+    cfg.home_stable_px = max(1, min(int(cfg.home_stable_px), 50))
+    cfg.home_retry_s = max(0.5, min(float(cfg.home_retry_s), 60.0))
+    cfg.home_max_attempts = max(1, min(int(cfg.home_max_attempts), 20))
+    cfg.home_match_threshold = max(0.3, min(float(cfg.home_match_threshold), 0.99))
+    cfg.home_max_samples = max(1, min(int(cfg.home_max_samples), 500))
+    cfg.home_auto_min_score = max(0.4, min(float(cfg.home_auto_min_score), 0.95))
+    cfg.home_auto_interval_s = max(0.5, min(float(cfg.home_auto_interval_s), 120.0))
+    cfg.home_force_after_s = max(1.0, min(float(cfg.home_force_after_s), 300.0))
+    cfg.home_template_w = max(24, min(int(cfg.home_template_w), 400))
+    cfg.home_template_h = max(40, min(int(cfg.home_template_h), 600))
+    cfg.home_shift_min_response = max(0.02, min(float(cfg.home_shift_min_response), 0.9))
     valid_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
     cfg.console_log_level = str(cfg.console_log_level).upper()
     cfg.file_log_level = str(cfg.file_log_level).upper()
@@ -1901,6 +1946,18 @@ class Library:
 # ============================================================
 # Safety
 # ============================================================
+def _cursor_pos() -> Optional[Tuple[int, int]]:
+    """Screen position of the mouse (Windows), or None."""
+    if sys.platform != "win32":
+        return None
+    class _PT(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+    pt = _PT()
+    if not ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
+        return None
+    return int(pt.x), int(pt.y)
+
+
 class Safety:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -2108,6 +2165,28 @@ class AutonomousBot:
                     log.warning("POPUP auto-dismiss off: %s not found next to main.py", img.name)
             except Exception as exc:
                 log.warning("POPUP auto-dismiss disabled: %s", exc)
+
+        self.home_guard = None
+        self._home_capture_pt: Optional[Tuple[int, int]] = None
+        self._last_home_err = 0.0
+        if getattr(cfg, "home_guard", False):
+            if HomeGuard is None:
+                log.warning("home_guard.py not found next to main.py; return-to-start-spot disabled.")
+            else:
+                try:
+                    self.home_guard = HomeGuard(root, cfg)
+                    state = "ON" if getattr(self.home_guard, "enabled", True) else "OFF"
+                    if self.home_guard.has_template():
+                        log.info("HOME: return-to-start-spot %s (%s = toggle on/off, %s = new avatar picture; matching=%s).",
+                                 state, cfg.hk_home_rearm.upper(), cfg.hk_home.upper(),
+                                 getattr(self.home_guard, "_backend", "cpu"))
+                    else:
+                        log.info("HOME: return-to-start-spot is ready but has no avatar picture yet: press %s and drag a "
+                                 "box around your character (head to feet). %s toggles search+home on/off.",
+                                 cfg.hk_home.upper(), cfg.hk_home_rearm.upper())
+                except Exception as exc:
+                    log.warning("home guard disabled: %s", exc)
+                    self.home_guard = None
 
     # ---------- reward watchers ----------
     def _load_watchers(self) -> None:
@@ -2416,6 +2495,13 @@ class AutonomousBot:
                 self._do_reload()
                 continue
             if self.paused:
+                if self._home_capture_pt is not None:
+                    try:
+                        r_, f_ = self._capture()
+                        if r_ is not None and f_ is not None:
+                            self._home_serve_requests(r_, f_)
+                    except Exception as exc:
+                        log.warning("HOME: could not serve the request while paused: %s", exc)
                 time.sleep(0.1)
                 continue
             try:
@@ -2493,6 +2579,7 @@ class AutonomousBot:
             return
 
         self._last_capture_warning = 0.0
+        self._home_serve_requests(rect, frame)
         self.frames_seen += 1
         self._total_frames += 1
         now = time.time()
@@ -2644,6 +2731,9 @@ class AutonomousBot:
         # it visualizes the same candidates and click decision shown in the log.
         self._write_debug_overlay(frame)
         
+        # Put the character back on its starting spot when nothing else is going on.
+        self._home_step(frame, rect, now, bool(action))
+
         # Report Ectoplaz total to Discord every N seconds
         if self.reporter is not None:
             self.reporter.check_and_report(frame)
@@ -3712,6 +3802,13 @@ class AutonomousBot:
                 items = gs.overlay_items(now)
                 if self.teacher is not None:
                     items = self.teacher.process(frame, rect, now, items)
+                if self.home_guard is not None:
+                    hboxes = self.home_guard.overlay_boxes(now)
+                    hnotes = self.home_guard.overlay_notes()
+                    if hboxes or hnotes:
+                        items = dict(items)
+                        items["boxes"] = list(items.get("boxes", [])) + hboxes
+                        items["notes"] = list(items.get("notes", [])) + hnotes
                 self.overlay.push(rect, items)
             elif self.teacher is not None:       # no overlay (or no window rect): the Teach window still works
                 self.teacher.process(frame, rect, now, {})
@@ -4012,6 +4109,102 @@ class AutonomousBot:
         log.info("POPUP action '%s' sent at (%d,%d) with %s", action, x, y, kwargs)
         return True
     
+    # ---------- return to the starting spot ----------
+    def request_home_capture(self) -> None:
+        """Hotkey: the next frame is frozen in a window where you drag a box around your character."""
+        self._home_capture_pt = _cursor_pos() or (-1, -1)     # the mouse is only the fallback when no window can open
+
+    def request_home_rearm(self) -> None:
+        """Hotkey F5: toggle the whole home system (character search + return-to-home) on/off."""
+        hg = self.home_guard
+        if hg is None:
+            return
+        try:
+            hg.toggle_enabled()
+        except Exception as exc:
+            log.warning("HOME toggle failed: %s", exc)
+
+    def _home_serve_requests(self, rect, frame) -> None:
+        hg = self.home_guard
+        if hg is None:
+            self._home_capture_pt = None
+            return
+        try:
+            if self._home_capture_pt is not None:
+                sx, sy = self._home_capture_pt
+                self._home_capture_pt = None
+                log.info("HOME: screen frozen - drag a box around your character (head to feet), then press ENTER "
+                         "(ESC cancels). The bot waits meanwhile.")
+                try:
+                    box = hg.pick_box(frame)
+                except RuntimeError as exc:                   # no picture window possible: fall back to the mouse
+                    log.warning("HOME: %s - using the mouse position as the feet instead.", exc)
+                    fx, fy = sx - int(rect["left"]), sy - int(rect["top"])
+                    if 0 <= fx < frame.shape[1] and 0 <= fy < frame.shape[0]:
+                        hg.capture_from_point(frame, fx, fy)
+                    else:
+                        log.warning("HOME: the mouse was outside the game window - hover the character's feet and "
+                                    "press %s again.", self.cfg.hk_home.upper())
+                else:
+                    if box is None:
+                        log.info("HOME: cancelled.")
+                    else:
+                        hg.capture_box(frame, box)
+        except Exception as exc:
+            log.warning("HOME request failed: %s", exc)
+
+    def _home_step(self, frame, rect, now, acted: bool) -> None:
+        hg = self.home_guard
+        if hg is None:
+            return
+        try:
+            busy = bool(acted) or (now - self.last_global_click) < self.cfg.home_quiet_s
+            if not busy and self.ghost_scene is not None and self.ghost_scene.wave_active:
+                busy = True                                   # a wave is being cleared: ghosts first
+            hard = False
+            if self.smart is not None:                        # the human is playing (Live): never fight the mouse
+                clicks = getattr(self.smart, "_recent_user_clicks", None)
+                if clicks and now - clicks[-1][0] < self.cfg.home_user_idle_s:
+                    hard = True
+            pt = hg.decide(frame, now, busy, hard)
+            if pt is not None:
+                self._home_click(rect, pt[0], pt[1])
+        except Exception as exc:                              # must never be able to stop the bot
+            if now - self._last_home_err > 5.0:
+                log.exception("HOME step error (continuing): %s", exc)
+                self._last_home_err = now
+
+    def _home_click(self, rect, fx: int, fy: int) -> bool:
+        x, y = int(rect["left"]) + int(fx), int(rect["top"]) + int(fy)
+        if not self.safety.can_click():
+            return False
+        if self.safety.in_exclusion(fx, fy):
+            log.info("HOME: home spot (%d,%d) is inside an exclusion zone; not clicking.", fx, fy)
+            return False
+        if self.dry_run:
+            log.info("DRY RUN HOME would click the home spot screen=(%d,%d)", x, y)
+            return True
+        if not HAS_DIRECT_INPUT or pydirectinput is None:
+            return False
+        if self.window.hwnd:
+            self.window.focus()
+            if self.cfg.require_game_under_cursor and not self.window.owns_point(x, y):
+                time.sleep(0.05)
+                if not self.window.owns_point(x, y):
+                    return False
+        if self.smart is not None:
+            self.smart.note_bot_click(x, y)                   # the learner must not read this as a ghost click
+        try:
+            pydirectinput.moveTo(x, y)
+            pydirectinput.click()
+        except Exception as exc:
+            log.error("HOME click failed: %s", exc)
+            return False
+        self.safety.note_click()
+        self.last_global_click = time.time()
+        log.info("HOME CLICK screen=(%d,%d)", x, y)
+        return True
+
     # ---------- zone drawing ----------
     def _draw_zone(self):
         if not HAS_PYNPUT:
@@ -4235,13 +4428,18 @@ def main():
             keyboard.add_hotkey(cfg.hk_quit, bot.stop)
             keyboard.add_hotkey(cfg.hk_zone, bot.request_zone)
             keyboard.add_hotkey(cfg.hk_reload, bot.request_reload)
+            if bot.home_guard is not None:
+                keyboard.add_hotkey(cfg.hk_home, bot.request_home_capture)
+                keyboard.add_hotkey(cfg.hk_home_rearm, bot.request_home_rearm)
             if bot.smart is not None:
                 keyboard.add_hotkey(cfg.hk_bad, bot.smart.mark_bad)
             f4 = bot.teacher is not None and cfg.overlay_teach and bot.teacher.has_overlay
             if f4:
                 keyboard.add_hotkey(cfg.hk_teach, bot.teacher.request_toggle)
-            log.info("Hotkeys registered (F9 pause, F7 exclusion, F10 reload, F8 bad-click, F12 quit%s).",
-                     f", {cfg.hk_teach.upper()} teach mode" if f4 else "")
+            log.info("Hotkeys registered (F9 pause, F7 exclusion, F10 reload, F8 bad-click, F12 quit%s%s).",
+                     f", {cfg.hk_teach.upper()} teach mode" if f4 else "",
+                     f", {cfg.hk_home.upper()} draw a box around my character, {cfg.hk_home_rearm.upper()} toggle home on/off"
+                     if bot.home_guard is not None else "")
         except Exception as exc:
             log.warning("Could not register global hotkeys (%s); use Ctrl+C to quit.", exc)
     else:
