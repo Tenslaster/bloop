@@ -1027,6 +1027,7 @@ class VisionGUI:
         used_engine = used & config_keys
         missing = [k for k in botmod.Config.__dataclass_fields__ if k not in used_engine and k != "patient_mode"]
         groups = {
+            "Return to start spot": ["home_guard", "home_camera_follow", "home_tolerance_px", "home_check_interval_s", "home_quiet_s", "home_user_idle_s", "home_stable_px", "home_force_after_s", "home_retry_s", "home_max_attempts", "home_match_threshold", "home_auto_learn", "home_max_samples", "home_auto_min_score", "home_auto_interval_s", "home_template_w", "home_template_h", "home_shift_min_response", "hk_home", "hk_home_rearm"],
             "Hotkeys & exclusions": ["hk_pause", "hk_quit", "hk_zone", "hk_reload", "hk_bad", "exclusion_zones"],
             "Scan cadence & frame stability": ["idle_delay", "multi_delay", "skip_unchanged_frames", "unchanged_rescan_interval_s", "changed_pixel_delta", "changed_pixel_fraction", "template_fallback_interval_frames"],
             "Smart tracking & operator hand-off": ["smart_track_cooldown_s", "smart_yield_s", "smart_penalize_static", "auto_learn_roi"],
@@ -1073,6 +1074,26 @@ class VisionGUI:
             "smart_probe": "Enable periodic diagnostic probing. Keep disabled for ordinary production operation unless investigating a specific issue.",
             "smart_probe_interval_s": "Interval between diagnostic probes when probing is enabled.",
             "webhook_interval_s": "Legacy/reporting interval retained for compatibility with the reporter configuration.",
+            "home_guard": "Click back on the spot where your character stood at start whenever it has wandered off (click-to-move games). Needs pictures of your character: press the picture hotkey (F6) and draw a box around it.",
+            "home_camera_follow": "Turn on if the game view scrolls with your character. The scroll is measured and the home click is corrected by it. Leave off in rooms where the view stays still.",
+            "home_tolerance_px": "The character may be this many pixels away from home before the bot clicks it back.",
+            "home_check_interval_s": "How often the bot looks for the character.",
+            "home_quiet_s": "The bot only goes home after this many seconds without clicking a ghost.",
+            "home_user_idle_s": "In Live mode: wait this many seconds after YOUR last click before going home.",
+            "home_stable_px": "The character must have stopped walking (moved less than this between two checks) before it is judged.",
+            "home_force_after_s": "If the character has been away from home this long while the bot keeps clicking ghosts, it goes home anyway.",
+            "home_retry_s": "Minimum time between two return-home clicks.",
+            "home_max_attempts": "After this many return clicks that did not work the bot pauses return-home for 15 s.",
+            "home_match_threshold": "How sure the picture match must be (0.30-0.99) to accept 'that is my character'. Lower it if the character is often not found; raise it if it locks onto other things.",
+            "home_auto_learn": "While running, add a new avatar picture by itself whenever it recognises you in a pose it does not have yet.",
+            "home_max_samples": "How many avatar pictures are kept. When full, the oldest automatic one is replaced (the ones you took with the hotkey are kept).",
+            "home_auto_min_score": "A new pose is only learned when the match is at least this sure, so it never learns from something that is not you.",
+            "home_auto_interval_s": "At most one automatic picture per this many seconds.",
+            "home_template_w": "Only used if the picture window cannot open: width of the box that ends at the mouse position.",
+            "home_template_h": "Only used if the picture window cannot open: height of the box that ends at the mouse position.",
+            "home_shift_min_response": "Camera-follow only: minimum confidence of the scroll measurement; below it the bot does nothing instead of guessing.",
+            "hk_home": "Press it, then drag a box around your character on the frozen picture, from the top of the head to the feet, as tight as you can, and press ENTER. Do it a few times in different poses. The bot also learns poses by itself.",
+            "hk_home_rearm": "Press to make the character's current spot the new home (uses the saved avatar picture).",
         }
         placed = set()
         row = 1
@@ -1134,6 +1155,16 @@ class VisionGUI:
             "smart_aug_pos": "Positive augmentations per sample", "smart_aug_neg": "Negative augmentations per sample",
             "seed_similarity_hamming_max": "Maximum seed-family hash distance", "smart_yield_s": "Yield after user input (s)",
             "smart_track_cooldown_s": "Tracked-target cooldown (s)", "auto_learn_roi": "Limit learning to ROI",
+            "home_guard": "Return to start spot", "home_camera_follow": "View scrolls with my character",
+            "home_tolerance_px": "Allowed distance from home (px)", "home_check_interval_s": "Look for character every (s)",
+            "home_quiet_s": "Idle time before going home (s)", "home_user_idle_s": "Wait after my own click (s)",
+            "home_stable_px": "Standing-still tolerance (px)", "home_force_after_s": "Go home anyway after (s)", "home_retry_s": "Delay between return clicks (s)",
+            "home_max_attempts": "Return attempts before pausing", "home_match_threshold": "Character match threshold",
+            "home_auto_learn": "Learn new poses automatically", "home_max_samples": "Avatar pictures kept",
+            "home_auto_min_score": "Auto-learn minimum match", "home_auto_interval_s": "Auto-learn interval (s)",
+            "home_template_w": "Fallback box width (px)", "home_template_h": "Fallback box height (px)",
+            "home_shift_min_response": "Scroll-measure confidence", "hk_home": "Draw-a-box-around-me hotkey",
+            "hk_home_rearm": "Re-set home hotkey",
         }
         return labels.get(key, key.replace("_", " ").strip().capitalize())
 
