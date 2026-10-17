@@ -609,7 +609,7 @@ class Tracker:
 # Sample store
 # ============================================================
 class SampleStore:
-    def __init__(self, root: Path, max_neg: int = 5000, max_pos: int = 3000):
+    def __init__(self, root: Path, max_neg: int = 5000, max_pos: int = 5000):
         self.dir = root
         self.pos_dir = root / "positives"
         self.neg_dir = root / "negatives"
